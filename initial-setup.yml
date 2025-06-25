@@ -1,0 +1,132 @@
+---
+- name: Bootstrap and configure the system locally
+  hosts: localhost
+  connection: local
+  become: true
+  vars_files:
+    - vars.yml
+
+  tasks:
+
+    - name: Install locales package
+      apt:
+        name: locales
+        state: present
+        update_cache: true
+
+    - name: Ensure en_US.UTF-8 is uncommented in /etc/locale.gen
+      lineinfile:
+        path: /etc/locale.gen
+        regexp: '^#\s*en_US.UTF-8\s+UTF-8'
+        line: 'en_US.UTF-8 UTF-8'
+
+    - name: Regenerate locales
+      command: locale-gen
+
+    - name: Set default locale
+      copy:
+        dest: /etc/default/locale
+        content: |
+          LANG=en_US.UTF-8
+          LC_ALL=en_US.UTF-8
+        mode: '0644'
+
+    - name: Create groups
+      group:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - ansible
+
+    - name: Passwordless sudo for 'dlz'
+      copy:
+        dest: "/etc/sudoers.d/dlz"
+        content: "dlz ALL=(ALL) NOPASSWD: ALL"
+        mode: '0440'
+
+    - name: Create 'ansible' user
+      user:
+        name: ansible
+        shell: /bin/bash
+        groups: "ansible,sudo"
+        append: yes
+
+    - name: Passwordless sudo for 'ansible'
+      copy:
+        dest: "/etc/sudoers.d/ansible"
+        content: "ansible ALL=(ALL) NOPASSWD: ALL"
+        mode: '0440'
+
+    - name: Deploy SSH key to 'ansible'
+      authorized_key:
+        user: ansible
+        key: "{{ lookup('file', ssh_key_location) }}"
+
+    - name: Copy profile config to /root/
+      copy:
+        src: files/profile/
+        dest: /root/
+        owner: root
+        group: root
+        mode: '0644'
+        force: yes
+
+    - name: Find existing user home directories
+      find:
+        paths: /home
+        file_type: directory
+        recurse: no
+      register: home_dirs
+
+    - name: Copy profile config to all user home directories
+      copy:
+        src: files/profile/
+        dest: "{{ item.path }}/"
+        owner: "{{ item.path | basename }}"
+        group: "{{ item.path | basename }}"
+        mode: '0644'
+        force: yes
+      loop: "{{ home_dirs.files }}"
+      when: item.path | basename != 'lost+found'
+
+    - name: Copy profile config to /etc/skel/
+      copy:
+        src: files/profile/
+        dest: /etc/skel/
+        owner: root
+        group: root
+        mode: '0644'
+        force: yes
+
+    - name: Harden sshd_config
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "{{ item.regexp | default(omit) }}"
+        line: "{{ item.line }}"
+        state: "{{ item.state | default('present') }}"
+        validate: "sshd -t -f %s"
+      loop: "{{ sshd_hardening }}"
+
+    - name: Reload sshd
+      service:
+        name: sshd
+        state: reloaded
+
+    - name: Write netplan configuration
+      template:
+        src: templates/netplan.j2
+        dest: "/etc/netplan/{{ ansible_default_ipv4.interface }}.yaml"
+        mode: '0644'
+        force: yes
+
+    - name: Apply netplan
+      command: netplan apply
+
+    - name: Remove cloud-init config dirs
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/ssh/sshd_config.d/50-cloud-init.conf
+        - /etc/sudoers.d/90-cloud-init-users
+        - /etc/netplan/50-cloud-init.yaml
